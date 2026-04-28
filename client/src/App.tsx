@@ -43,6 +43,7 @@ type ProjectContext = {
 };
 
 type ActiveContextImpact = {
+  ecosystem: "codex" | "claude";
   projectName: string;
   score: number;
   level: "low" | "moderate" | "high";
@@ -57,6 +58,7 @@ type ActiveContextImpact = {
   localToolCandidates: AgentResource[];
   globalToolCandidates: AgentResource[];
   mcpServers: ConfigurationLoadAnalysis["mcpServers"];
+  runtimeConfigFiles: AgentResource[];
   alwaysLoaded: AgentResource[];
   caveats: string[];
 };
@@ -306,8 +308,11 @@ export function App() {
     };
   }, [activeProject, activeProjectId, scanResult]);
 
-  const activeContextImpact = useMemo(() => {
-    return buildActiveContextImpact(scanResult, activeProjectId, activeProject);
+  const codexActiveContextImpact = useMemo(() => {
+    return buildActiveContextImpact(scanResult, activeProjectId, activeProject, "codex");
+  }, [activeProject, activeProjectId, scanResult]);
+  const claudeActiveContextImpact = useMemo(() => {
+    return buildActiveContextImpact(scanResult, activeProjectId, activeProject, "claude");
   }, [activeProject, activeProjectId, scanResult]);
 
   useEffect(() => {
@@ -472,7 +477,8 @@ export function App() {
 
           {scanResult?.configurationLoad ? (
             <>
-              <ActiveContextImpactPanel impact={activeContextImpact} />
+              <ActiveContextImpactPanel impact={codexActiveContextImpact} />
+              <ActiveContextImpactPanel impact={claudeActiveContextImpact} />
               <ConfigurationLoadPanel configurationLoad={scanResult.configurationLoad} />
             </>
           ) : null}
@@ -674,29 +680,32 @@ function ActiveContextImpactPanel({ impact }: { impact: ActiveContextImpact | nu
     );
   }
 
+  const ecosystemLabel = ecosystemDisplayName(impact.ecosystem);
   const localCandidates = impact.localSkillCandidates.length + impact.localToolCandidates.length;
   const globalCandidates = impact.globalSkillCandidates.length + impact.globalToolCandidates.length;
+  const runtimeConfigValue = impact.ecosystem === "codex" ? impact.mcpServers.length : impact.runtimeConfigFiles.length;
+  const runtimeConfigLabel = impact.ecosystem === "codex" ? "MCP servers" : "Runtime config";
 
   return (
     <div className={`summary-card active-context-card impact-${impact.level}`}>
       <div className="card-header">
         <div>
           <span className="card-kicker">Active Context Impact</span>
-          <h2>{impact.projectName}</h2>
+          <h2>{ecosystemLabel}: {impact.projectName}</h2>
         </div>
         <span className="load-level">{impact.level}</span>
       </div>
       <div className="load-score-row">
         <strong>{impact.score.toLocaleString()}</strong>
         <p>
-          Likely Codex context for the selected project, compared with a default install. This uses readable files and
-          configured MCP declarations; final runtime-loaded prompts and tool schemas still need live trace evidence.
+          Likely {ecosystemLabel} context for the selected project, compared with a default install. This uses readable
+          files and discovered configuration; final runtime-loaded prompts and tool schemas still need live trace evidence.
         </p>
       </div>
       <div className="impact-metrics">
         <Metric label="Active rules" value={impact.alwaysLoaded.length} />
         <Metric label="Est. rule tokens" value={impact.instructionTokens} />
-        <Metric label="MCP servers" value={impact.mcpServers.length} />
+        <Metric label={runtimeConfigLabel} value={runtimeConfigValue} />
         <Metric label="Local candidates" value={localCandidates} />
       </div>
       <div className="load-subgrid">
@@ -724,8 +733,8 @@ function ActiveContextImpactPanel({ impact }: { impact: ActiveContextImpact | nu
             <span>{impact.evidenceLevel}</span>
           </div>
           <div className="impact-facts">
-            <span><b>Configured:</b> {impact.mcpServers.length.toLocaleString()} MCP servers from readable Codex config.</span>
-            <span><b>Likely local:</b> {localCandidates.toLocaleString()} project skills, commands, subagents, or plugins.</span>
+            <span><b>Configured:</b> {runtimeConfigSummary(impact)}</span>
+            <span><b>Likely local:</b> {localCandidates.toLocaleString()} project skills, commands, agents, or plugins.</span>
             <span><b>Visible inventory:</b> {globalCandidates.toLocaleString()} global candidates, capped in score because activation is not proven.</span>
             <span><b>Not counted active:</b> {impact.globalRuleInventory.length.toLocaleString()} global config/rule files.</span>
             <span><b>Conditional:</b> {impact.conditionalRuleFiles.length.toLocaleString()} nested rule files depend on working directory.</span>
@@ -1503,61 +1512,68 @@ function formatBaseline(baseline: string): string {
 function buildActiveContextImpact(
   scanResult: ScanResult | null,
   activeProjectId: string | null,
-  activeProject: Project | null
+  activeProject: Project | null,
+  ecosystem: "codex" | "claude"
 ): ActiveContextImpact | null {
   if (!scanResult || !activeProjectId || !activeProject) {
     return null;
   }
 
+  const instructionKind = ecosystem === "codex" ? "agents_md" : "claude_md";
   const appliesToActiveProject = (resource: AgentResource) =>
     resource.scope === "global" || resource.projectId === activeProjectId;
-  const allAgentsResources = scanResult.resources.filter(
+  const allInstructionResources = scanResult.resources.filter(
     (resource) =>
-      resource.ecosystem === "codex" &&
-      resource.kind === "agents_md" &&
+      resource.ecosystem === ecosystem &&
+      resource.kind === instructionKind &&
       !isDefaultCodexResourcePath(resource.path)
   );
-  const activeAgentsFiles = dedupeEffectiveResources(allAgentsResources
+  const activeInstructionFiles = dedupeEffectiveResources(allInstructionResources
     .filter((resource) => isAncestorOrSame(dirname(resource.path), activeProject.rootPath)))
     .sort((left, right) => left.path.localeCompare(right.path));
-  const conditionalAgentsFiles = dedupeEffectiveResources(allAgentsResources
+  const conditionalInstructionFiles = dedupeEffectiveResources(allInstructionResources
     .filter(
       (resource) => isAncestorOrSame(activeProject.rootPath, dirname(resource.path)) && dirname(resource.path) !== activeProject.rootPath
     ))
     .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
-  const codexResources = scanResult.resources.filter(
-    (resource) => resource.ecosystem === "codex" && appliesToActiveProject(resource) && !isDefaultCodexResourcePath(resource.path)
+  const ecosystemResources = scanResult.resources.filter(
+    (resource) => resource.ecosystem === ecosystem && appliesToActiveProject(resource) && !isDefaultCodexResourcePath(resource.path)
   );
-  const activeResources = dedupeResources([...codexResources, ...activeAgentsFiles]);
-  const ruleFiles = codexResources.filter((resource) =>
-    ["agents_md", "setting", "omx", "automation"].includes(resource.kind)
+  const activeResources = dedupeResources([...ecosystemResources, ...activeInstructionFiles]);
+  const ruleFiles = ecosystemResources.filter((resource) =>
+    [instructionKind, "setting", "omx", "automation"].includes(resource.kind)
   );
-  const isCodexConfig = (resource: AgentResource) => basename(resource.path).toLowerCase() === "config.toml";
-  const configuredProjectSettings = activeResources
-    .filter((resource) => resource.scope === "project" && isCodexConfig(resource));
-  const alwaysLoaded = dedupeResources(activeAgentsFiles)
+  const configuredProjectSettings = activeResources.filter(
+    (resource) => resource.scope === "project" && isRuntimeConfigResource(resource, ecosystem)
+  );
+  const alwaysLoaded = dedupeResources(activeInstructionFiles)
     .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
   const globalRuleInventory = ruleFiles
     .filter(
-      (resource) => resource.scope === "global" && resource.kind !== "agents_md" && !isCodexConfig(resource)
+      (resource) => resource.scope === "global" && resource.kind !== instructionKind && !isRuntimeConfigResource(resource, ecosystem)
     )
     .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
   const conditionalRuleFiles = ruleFiles
     .filter(
       (resource) =>
         resource.scope === "nested" ||
-        (resource.kind === "agents_md" && isAncestorOrSame(activeProject.rootPath, dirname(resource.path)) && dirname(resource.path) !== activeProject.rootPath)
+        (resource.kind === instructionKind && isAncestorOrSame(activeProject.rootPath, dirname(resource.path)) && dirname(resource.path) !== activeProject.rootPath)
     )
-    .concat(conditionalAgentsFiles)
+    .concat(conditionalInstructionFiles)
     .filter((resource, index, resources) => resources.findIndex((candidate) => candidate.id === resource.id) === index)
     .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
-  const skillCandidates = codexResources.filter((resource) => resource.kind === "skill");
-  const toolCandidates = codexResources.filter((resource) =>
-    ["command", "subagent", "plugin", "mcp"].includes(resource.kind)
+  const skillCandidates = ecosystemResources.filter((resource) => resource.kind === "skill");
+  const toolCandidates = ecosystemResources.filter((resource) =>
+    ecosystem === "codex"
+      ? ["command", "subagent", "plugin", "mcp"].includes(resource.kind)
+      : ["command", "subagent"].includes(resource.kind)
   );
-  const mcpServers = scanResult.configurationLoad.mcpServers.filter(
-    (server) => !server.projectId || server.projectId === activeProjectId
-  );
+  const mcpServers = ecosystem === "codex"
+    ? scanResult.configurationLoad.mcpServers.filter((server) => !server.projectId || server.projectId === activeProjectId)
+    : [];
+  const runtimeConfigFiles = activeResources
+    .filter((resource) => isRuntimeConfigResource(resource, ecosystem))
+    .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
   const localSkillCandidates = skillCandidates.filter((resource) => resource.projectId === activeProjectId);
   const globalSkillCandidates = skillCandidates.filter((resource) => resource.scope === "global");
   const localToolCandidates = toolCandidates.filter((resource) => resource.projectId === activeProjectId);
@@ -1565,22 +1581,23 @@ function buildActiveContextImpact(
   const instructionTokens = Math.ceil(alwaysLoaded.reduce((sum, resource) => sum + resource.size, 0) / 4);
   const promptScore = Math.min(100, (instructionTokens / 30000) * 100);
   const globalCandidateUnits = Math.min((globalSkillCandidates.length + globalToolCandidates.length) * 0.05, 10);
+  const runtimeConfigUnits = ecosystem === "codex" ? mcpServers.length * 5 : runtimeConfigFiles.length * 2;
   const runtimeSurfaceScore = Math.min(
     100,
-    ((localSkillCandidates.length + localToolCandidates.length + mcpServers.length * 5 + globalCandidateUnits) / 80) * 100
+    ((localSkillCandidates.length + localToolCandidates.length + runtimeConfigUnits + globalCandidateUnits) / 80) * 100
   );
   const scopeScore = Math.min(100, (conditionalRuleFiles.length / 10) * 100);
   const score = Math.round(promptScore * 0.55 + runtimeSurfaceScore * 0.35 + scopeScore * 0.1);
-  const confidence = codexResources.some((resource) => resource.scopeConfidence === "inferred") ? "inferred" : "exact";
+  const confidence = ecosystemResources.some((resource) => resource.scopeConfidence === "inferred") ? "inferred" : "exact";
   const evidenceLevel =
-    confidence === "exact" && mcpServers.length + alwaysLoaded.length + localSkillCandidates.length + localToolCandidates.length > 0
+    confidence === "exact" && runtimeConfigFiles.length + mcpServers.length + alwaysLoaded.length + localSkillCandidates.length + localToolCandidates.length > 0
       ? "file-backed"
       : "mixed-estimate";
   const caveats = [
     "Nested rule files are conditional and not counted as likely always loaded.",
     "Global skills and plugins are visible inventory, not treated as active session surface.",
     "Project config files are treated as configured runtime settings, not prompt-loaded rule text.",
-    "Exact loaded tool registry and final prompt still require Codex trace, session metadata, or measured runs."
+    "Exact loaded tool registry and final prompt still require runtime trace, session metadata, or measured runs."
   ];
 
   if (configuredProjectSettings.length > 0) {
@@ -1592,6 +1609,7 @@ function buildActiveContextImpact(
   }
 
   return {
+    ecosystem,
     projectName: activeProject.name,
     score,
     level: activeImpactLevel(score),
@@ -1606,6 +1624,7 @@ function buildActiveContextImpact(
     localToolCandidates,
     globalToolCandidates,
     mcpServers,
+    runtimeConfigFiles,
     alwaysLoaded,
     caveats
   };
@@ -1619,6 +1638,27 @@ function activeImpactLevel(score: number): ActiveContextImpact["level"] {
     return "moderate";
   }
   return "low";
+}
+
+function ecosystemDisplayName(ecosystem: ActiveContextImpact["ecosystem"]): string {
+  return ecosystem === "codex" ? "Codex" : "Claude";
+}
+
+function runtimeConfigSummary(impact: ActiveContextImpact): string {
+  if (impact.ecosystem === "codex") {
+    return `${impact.mcpServers.length.toLocaleString()} MCP servers from readable Codex config.`;
+  }
+
+  return `${impact.runtimeConfigFiles.length.toLocaleString()} Claude settings/config files visible to the selected project.`;
+}
+
+function isRuntimeConfigResource(resource: AgentResource, ecosystem: ActiveContextImpact["ecosystem"]): boolean {
+  const base = basename(resource.path).toLowerCase();
+  if (ecosystem === "codex") {
+    return base === "config.toml";
+  }
+
+  return resource.kind === "setting" || base.startsWith("settings.");
 }
 
 function isDefaultCodexResourcePath(resourcePath: string): boolean {

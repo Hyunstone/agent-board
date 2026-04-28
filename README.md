@@ -24,9 +24,9 @@ editing, and no automatic fixes.
   and project-local skills.
 - Shows project context for likely available skills, agents, and instruction
   files.
-- Estimates selected-project Codex context impact with likely active
-  `AGENTS.md`, configured MCP servers, local candidates, conditional nested
-  rules, and lower-confidence global inventory.
+- Estimates selected-project Codex and Claude context impact with likely active
+  instruction files, configured MCP/settings resources, local candidates,
+  conditional nested rules, and lower-confidence global inventory.
 - Shows workspace-wide scanned resource load across prompt footprint, tool
   surface, conflict risk, and scope complexity.
 - Provides a full inventory table with filters and lazy-loaded previews.
@@ -174,13 +174,14 @@ The main skill board shows:
 The project context panel shows the resources likely available when working in
 the selected project.
 
-The Active Context Impact panel focuses on the selected project:
+The Active Context Impact panels focus on the selected project:
 
-- `Likely Always Loaded`: ancestor `AGENTS.md` files that apply to the selected
-  project path. Project `config.toml` files are treated as runtime
+- `Likely Always Loaded`: ancestor `AGENTS.md` or `CLAUDE.md` files that apply
+  to the selected project path. Project config files are treated as runtime
   configuration, not prompt-loaded rule text.
-- `Runtime Surface`: configured MCP servers and project-local tool candidates.
-  Global skills and plugins are shown as visible inventory, not assumed active.
+- `Runtime Surface`: configured Codex MCP servers, Claude settings, and
+  project-local tool candidates. Global skills, commands, plugins, and agents
+  are shown as visible inventory, not assumed active.
 - Conditional nested rule files are counted separately because they depend on
   the active working directory.
 
