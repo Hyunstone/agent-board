@@ -24,6 +24,11 @@ editing, and no automatic fixes.
   and project-local skills.
 - Shows project context for likely available skills, agents, and instruction
   files.
+- Estimates selected-project Codex context impact with likely active
+  `AGENTS.md`, configured MCP servers, local candidates, conditional nested
+  rules, and lower-confidence global inventory.
+- Shows workspace-wide scanned resource load across prompt footprint, tool
+  surface, conflict risk, and scope complexity.
 - Provides a full inventory table with filters and lazy-loaded previews.
 - Stores only the most recent scan in server memory.
 - Persists workspace root inputs only in browser `localStorage`.
@@ -36,6 +41,8 @@ Agent Board is designed as a local filesystem viewer.
 - Scans are read-only.
 - Symlinks are not followed.
 - Large previews are skipped.
+- Large, symlinked, binary-like, or unreadable files are not loaded for content
+  identity or MCP extraction.
 - Preview requests use resource ids from the last scan, not arbitrary file
   paths.
 - Workspace roots are not persisted on the server.
@@ -146,6 +153,12 @@ Scope and availability are inferred from file locations. Tool-specific runtime
 loading rules can differ by Codex or Claude version, so treat the dashboard as a
 high-signal inventory rather than a final execution oracle.
 
+Git worktrees are handled as separate physical scan targets, but exact duplicate
+resources from the same repository, same project-relative path, and same content
+are collapsed for load analysis and active-context display. Same-content
+`AGENTS.md` files in different subtrees are not collapsed because their location
+defines their scope.
+
 ## UI Guide
 
 Use the top bar to add or remove workspace roots, add suggested common paths,
@@ -160,6 +173,21 @@ The main skill board shows:
 
 The project context panel shows the resources likely available when working in
 the selected project.
+
+The Active Context Impact panel focuses on the selected project:
+
+- `Likely Always Loaded`: ancestor `AGENTS.md` files that apply to the selected
+  project path. Project `config.toml` files are treated as runtime
+  configuration, not prompt-loaded rule text.
+- `Runtime Surface`: configured MCP servers and project-local tool candidates.
+  Global skills and plugins are shown as visible inventory, not assumed active.
+- Conditional nested rule files are counted separately because they depend on
+  the active working directory.
+
+The Workspace Inventory panel is broader. It summarizes all scanned roots and
+excludes bundled/default Codex resources where they can be identified. Scores are
+static estimates from readable files and discovered configuration, not measured
+latency, token usage, or runtime tool registry size.
 
 The inventory table is still available for detailed filtering, path inspection,
 status badges, and previewing individual files.
@@ -195,5 +223,8 @@ or no longer present in the latest scan cache.
 - No editing, saving, or automatic cleanup.
 - No LLM-based semantic analysis.
 - No database or historical scan comparison.
+- No direct access to the final runtime-loaded instruction stack or tool
+  registry. Runtime activation still needs trace/session evidence or measured
+  runs.
 - Cursor, Windsurf, and other agent ecosystems are not included in the MVP.
 - Claude scope is inferred because runtime loading can vary by tool version.
