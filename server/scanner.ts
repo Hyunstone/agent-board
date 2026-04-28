@@ -1,14 +1,19 @@
 import fg from "fast-glob";
 import { createHash } from "crypto";
-import { existsSync, lstatSync, statSync, promises as fs } from "fs";
+import { existsSync, lstatSync, readFileSync, statSync, promises as fs } from "fs";
 import os from "os";
 import path from "path";
 import { getCommonWorkspaceRoots, getDefaultWorkspaceRoot } from "./config";
 import type {
   AgentResource,
+  ConfigurationLoadAnalysis,
   DefaultsResponse,
   Ecosystem,
+  LoadCategory,
+  LoadContributor,
+  LoadLevel,
   Project,
+  ProjectLoadSummary,
   Relationship,
   ResourceKind,
   ResourcePreview,
@@ -26,8 +31,11 @@ export interface ScannerOptions {
 
 interface ScannedResource extends AgentResource {
   signature: string;
+  contentIdentity?: string;
+  relativePathFromProject?: string;
   projectRoot?: string;
   workspaceRoot?: string;
+  repositoryKey?: string;
   detectedBy?: Project["detectedBy"];
   previewLimitBytes: number;
 }
@@ -89,6 +97,9 @@ const GLOBAL_ALLOWLIST_PATTERNS = [
   "plugins/**/*.{md,json,toml,yaml,yml,js,ts}",
   "automations/**/automation.toml"
 ];
+const PROMPT_LOAD_KINDS = new Set<ResourceKind>(["agents_md", "claude_md", "setting", "omx", "automation"]);
+const TOOL_LOAD_KINDS = new Set<ResourceKind>(["skill", "command", "subagent", "plugin", "mcp"]);
+const CONFLICT_RELATIONSHIP_TYPES = new Set(["duplicate_candidate", "shadows", "shadowed_by"]);
 
 let lastScanCache: ScanCache | null = null;
 
@@ -172,14 +183,14 @@ export async function scanWorkspaceRoots(
       const resources: ScannedResource[] = [];
       for (const entry of entries) {
         const stat = entry.stats ?? statSync(entry.path);
-        resources.push(buildResource(entry.path, stat.size, stat.mtimeMs, target.isGlobal, normalizedWorkspaceRoots, homeDir, previewLimitBytes));
+        resources.push(await buildResource(entry.path, stat.size, stat.mtimeMs, target.isGlobal, normalizedWorkspaceRoots, homeDir, previewLimitBytes));
       }
 
       return resources;
     })
   );
 
-  const resources = scannedResources.flat().sort((left, right) => left.path.localeCompare(right.path));
+  const resources = dedupeScannedResources(scannedResources.flat()).sort((left, right) => left.path.localeCompare(right.path));
   const projects = buildProjects(resources);
   const relationships = buildRelationships(resources);
   const duplicateIds = new Set(
@@ -213,12 +224,14 @@ export async function scanWorkspaceRoots(
     project.resourceCounts = projectResourceCounts.get(project.id) ?? {};
     project.statusCounts = projectStatusCounts.get(project.id) ?? {};
   }
+  const configurationLoad = await buildConfigurationLoad(resources, relationships, projects, homeDir);
 
   const result: ScanResult = {
     workspaceRoots: normalizedWorkspaceRoots,
     projects,
     resources: resources.map(stripScannedResource),
     relationships,
+    configurationLoad,
     warnings,
     scannedAt
   };
@@ -260,7 +273,7 @@ export function getLastScanCache(): ScanCache | null {
   return lastScanCache;
 }
 
-function buildResource(
+async function buildResource(
   filePath: string,
   size: number,
   mtimeMs: number,
@@ -268,17 +281,21 @@ function buildResource(
   workspaceRoots: string[],
   homeDir: string,
   previewLimitBytes: number
-): ScannedResource {
+): Promise<ScannedResource> {
   const normalizedPath = resolveAbsolutePath(filePath);
   const ecosystem = detectEcosystem(normalizedPath, homeDir);
   const projectLocation = isGlobal ? null : detectProjectLocation(normalizedPath, workspaceRoots);
   const projectRoot = projectLocation?.projectRoot;
   const workspaceRoot = projectLocation?.workspaceRoot;
+  const repositoryKey = detectRepositoryKey(projectRoot);
   const scopeRoot = detectScopeRoot(normalizedPath, projectRoot);
   const scope = determineScope(normalizedPath, projectRoot, scopeRoot, isGlobal);
   const kind = classifyKind(normalizedPath);
   const name = detectResourceName(normalizedPath, kind);
   const signature = buildSignature(normalizedPath, scopeRoot);
+  const relativePathFromProject = projectRoot ? toPosix(path.relative(projectRoot, normalizedPath)).toLowerCase() : undefined;
+  const contentIdentity = await readContentIdentity(normalizedPath, size, previewLimitBytes);
+  const effectiveResourceKey = buildEffectiveResourceKey(ecosystem, kind, repositoryKey, relativePathFromProject, contentIdentity);
   const status: ResourceStatus = size > previewLimitBytes ? "skipped_large" : "ok";
   const projectId = projectRoot ? sha1(projectRoot) : undefined;
   const scopeConfidence = detectScopeConfidence(ecosystem, kind, projectRoot, scopeRoot, isGlobal);
@@ -295,14 +312,18 @@ function buildResource(
     scopeConfidence,
     path: normalizedPath,
     projectId,
+    effectiveResourceKey,
     mtime: new Date(mtimeMs).toISOString(),
     size,
     summary,
     tags,
     status,
     signature,
+    contentIdentity,
+    relativePathFromProject,
     projectRoot,
     workspaceRoot,
+    repositoryKey,
     detectedBy: projectLocation?.detectedBy,
     previewLimitBytes
   };
@@ -461,7 +482,10 @@ function buildProjects(resources: ScannedResource[]): Project[] {
 
 function buildRelationships(resources: ScannedResource[]): Relationship[] {
   const relationships: Relationship[] = [];
-  const bySignature = groupBy(resources, (resource) => `${resource.ecosystem}:${resource.kind}:${resource.signature}`);
+  const bySignature = groupBy(
+    resources,
+    (resource) => `${resource.ecosystem}:${resource.kind}:${relationshipDomainKey(resource)}:${resource.signature}`
+  );
 
   for (const group of bySignature.values()) {
     if (group.length < 2) {
@@ -474,6 +498,10 @@ function buildRelationships(resources: ScannedResource[]): Relationship[] {
       const current = ordered[index];
       for (let shadowedIndex = 0; shadowedIndex < index; shadowedIndex += 1) {
         const shadowed = ordered[shadowedIndex];
+        if (scopeRank(current.scope) === scopeRank(shadowed.scope)) {
+          continue;
+        }
+
         relationships.push({
           type: "shadows",
           fromResourceId: current.id,
@@ -493,19 +521,22 @@ function buildRelationships(resources: ScannedResource[]): Relationship[] {
 
     const rankGroups = groupBy(group, (resource) => scopeRank(resource.scope));
     for (const sameRankGroup of rankGroups.values()) {
-      if (sameRankGroup.length < 2) {
-        continue;
-      }
+      const duplicateGroups = groupBy(sameRankGroup, duplicateIdentityKey);
+      for (const duplicateGroup of duplicateGroups.values()) {
+        if (duplicateGroup.length < 2) {
+          continue;
+        }
 
-      const [canonical, ...duplicates] = [...sameRankGroup].sort((left, right) => left.path.localeCompare(right.path));
-      for (const duplicate of duplicates) {
-        relationships.push({
-          type: "duplicate_candidate",
-          fromResourceId: duplicate.id,
-          toResourceId: canonical.id,
-          projectId: duplicate.projectId ?? canonical.projectId,
-          reason: "Allowlisted resource with the same signature appears in multiple roots"
-        });
+        const [canonical, ...duplicates] = [...duplicateGroup].sort((left, right) => left.path.localeCompare(right.path));
+        for (const duplicate of duplicates) {
+          relationships.push({
+            type: "duplicate_candidate",
+            fromResourceId: duplicate.id,
+            toResourceId: canonical.id,
+            projectId: duplicate.projectId ?? canonical.projectId,
+            reason: "Allowlisted resource with the same signature and content appears in multiple roots"
+          });
+        }
       }
     }
   }
@@ -541,6 +572,319 @@ function buildRelationships(resources: ScannedResource[]): Relationship[] {
   }
 
   return relationships.sort((left, right) => left.type.localeCompare(right.type) || left.fromResourceId.localeCompare(right.fromResourceId) || (left.toResourceId ?? "").localeCompare(right.toResourceId ?? ""));
+}
+
+async function buildConfigurationLoad(
+  resources: ScannedResource[],
+  relationships: Relationship[],
+  projects: Project[],
+  homeDir: string
+): Promise<ConfigurationLoadAnalysis> {
+  const projectById = new Map(projects.map((project) => [project.id, project]));
+  const baselineIds = new Set(resources.filter((resource) => isCodexDefaultResource(resource.path, homeDir)).map((resource) => resource.id));
+  const userResources = dedupeWorktreeEquivalentResources(resources.filter((resource) => !baselineIds.has(resource.id)));
+  const userResourceIds = new Set(userResources.map((resource) => resource.id));
+  const promptResources = userResources.filter((resource) => PROMPT_LOAD_KINDS.has(resource.kind));
+  const toolResources = userResources.filter((resource) => TOOL_LOAD_KINDS.has(resource.kind));
+  const mcpServers = await extractMcpServers(userResources);
+  const conflictRelationships = relationships.filter(
+    (relationship) =>
+      (userResourceIds.has(relationship.fromResourceId) || Boolean(relationship.toResourceId && userResourceIds.has(relationship.toResourceId))) &&
+      CONFLICT_RELATIONSHIP_TYPES.has(relationship.type)
+  );
+  const nestedResources = userResources.filter((resource) => resource.scope === "nested").length;
+  const projectsWithLocalResources = new Set(
+    userResources
+      .filter((resource) => resource.projectId && resource.scope !== "global")
+      .map((resource) => resource.projectId as string)
+  ).size;
+  const estimatedTokens = Math.ceil(sumBy(promptResources, (resource) => resource.size) / 4);
+  const toolSurfaceUnits = toolResources.length + mcpServers.length;
+  const promptScore = clampScore((estimatedTokens / 20000) * 100);
+  const toolScore = clampScore((toolSurfaceUnits / 50) * 100);
+  const conflictScore = clampScore((conflictRelationships.length / 20) * 100);
+  const scopeScore = clampScore(((nestedResources + projectsWithLocalResources * 2) / 40) * 100);
+  const score = clampScore(promptScore * 0.35 + toolScore * 0.3 + conflictScore * 0.2 + scopeScore * 0.15);
+
+  return {
+    baseline: "codex_default_install",
+    score,
+    level: loadLevel(score),
+    excludedDefaultResources: baselineIds.size,
+    categories: [
+      {
+        key: "prompt_footprint",
+        label: "Prompt Footprint",
+        score: promptScore,
+        value: estimatedTokens,
+        detail: `${promptResources.length.toLocaleString()} instruction/config resources, ~${estimatedTokens.toLocaleString()} estimated tokens`
+      },
+      {
+        key: "tool_surface",
+        label: "Tool Surface",
+        score: toolScore,
+        value: toolSurfaceUnits,
+        detail: `${toolResources.length.toLocaleString()} tool resources plus ${mcpServers.length.toLocaleString()} MCP servers`
+      },
+      {
+        key: "conflict_risk",
+        label: "Conflict Risk",
+        score: conflictScore,
+        value: conflictRelationships.length,
+        detail: `${conflictRelationships.length.toLocaleString()} duplicate or shadowing relationships`
+      },
+      {
+        key: "scope_complexity",
+        label: "Scope Complexity",
+        score: scopeScore,
+        value: nestedResources + projectsWithLocalResources * 2,
+        detail: `${nestedResources.toLocaleString()} nested resources across ${projectsWithLocalResources.toLocaleString()} projects with local resources`
+      }
+    ] satisfies LoadCategory[],
+    topContributors: buildLoadContributors(promptResources, toolResources, conflictRelationships, mcpServers, projectById).slice(0, 5),
+    projectSummaries: buildProjectLoadSummaries(userResources, projects).slice(0, 5),
+    mcpServers: buildMcpServerContributors(mcpServers, projectById)
+  };
+}
+
+function buildLoadContributors(
+  promptResources: ScannedResource[],
+  toolResources: ScannedResource[],
+  conflictRelationships: Relationship[],
+  mcpServers: Array<{ name: string; resource: ScannedResource }>,
+  projectById: Map<string, Project>
+): LoadContributor[] {
+  const contributors: LoadContributor[] = [];
+
+  for (const resource of promptResources) {
+    const estimatedTokens = Math.ceil(resource.size / 4);
+    contributors.push({
+      label: displayResourceLabel(resource),
+      kind: resource.kind,
+      resourceId: resource.id,
+      projectId: resource.projectId,
+      projectName: resource.projectId ? projectById.get(resource.projectId)?.name : undefined,
+      score: estimatedTokens,
+      reason: `Prompt/config footprint: ~${estimatedTokens.toLocaleString()} estimated tokens`
+    });
+  }
+
+  for (const resource of toolResources) {
+    contributors.push({
+      label: displayResourceLabel(resource),
+      kind: resource.kind,
+      resourceId: resource.id,
+      projectId: resource.projectId,
+      projectName: resource.projectId ? projectById.get(resource.projectId)?.name : undefined,
+      score: 1,
+      reason: `Adds one ${resource.kind} resource to the available tool surface`
+    });
+  }
+
+  for (const server of mcpServers) {
+    contributors.push({
+      label: server.name,
+      kind: "mcp_server",
+      resourceId: server.resource.id,
+      projectId: server.resource.projectId,
+      projectName: server.resource.projectId ? projectById.get(server.resource.projectId)?.name : undefined,
+      score: 1,
+      reason: `MCP server declared in ${displayResourceLabel(server.resource)}`
+    });
+  }
+
+  const duplicateCount = conflictRelationships.filter((relationship) => relationship.type === "duplicate_candidate").length;
+  if (duplicateCount > 0) {
+    contributors.push({
+      label: "Duplicate candidates",
+      kind: "other",
+      score: duplicateCount,
+      reason: `${duplicateCount.toLocaleString()} exact duplicate resources found across scanned roots or worktrees`
+    });
+  }
+
+  const conflictCounts = countBy(
+    conflictRelationships.filter((relationship) => relationship.type !== "duplicate_candidate"),
+    (relationship) => relationship.fromResourceId
+  );
+  for (const [resourceId, count] of Object.entries(conflictCounts)) {
+    const resource = [...promptResources, ...toolResources].find((candidate) => candidate.id === resourceId);
+    contributors.push({
+      label: resource ? displayResourceLabel(resource) : resourceId.slice(0, 8),
+      kind: resource?.kind ?? "other",
+      resourceId,
+      projectId: resource?.projectId,
+      projectName: resource?.projectId ? projectById.get(resource.projectId)?.name : undefined,
+      score: count,
+      reason: `${count.toLocaleString()} duplicate or shadowing relationships`
+    });
+  }
+
+  return contributors.sort((left, right) => right.score - left.score || left.label.localeCompare(right.label));
+}
+
+function buildMcpServerContributors(
+  mcpServers: Array<{ name: string; resource: ScannedResource }>,
+  projectById: Map<string, Project>
+): LoadContributor[] {
+  return mcpServers.map((server) => ({
+    label: server.name,
+    kind: "mcp_server",
+    resourceId: server.resource.id,
+    projectId: server.resource.projectId,
+    projectName: server.resource.projectId ? projectById.get(server.resource.projectId)?.name : undefined,
+    score: 1,
+    reason: `MCP server declared in ${displayResourceLabel(server.resource)}`
+  }));
+}
+
+function buildProjectLoadSummaries(resources: ScannedResource[], projects: Project[]): ProjectLoadSummary[] {
+  return projects
+    .map((project) => {
+      const projectResources = resources.filter((resource) => resource.projectId === project.id);
+      const estimatedTokens = Math.ceil(sumBy(projectResources.filter((resource) => PROMPT_LOAD_KINDS.has(resource.kind)), (resource) => resource.size) / 4);
+      const toolUnits = projectResources.filter((resource) => TOOL_LOAD_KINDS.has(resource.kind)).length;
+      const nestedUnits = projectResources.filter((resource) => resource.scope === "nested").length;
+      const score = clampScore((estimatedTokens / 5000) * 45 + (toolUnits / 15) * 35 + (nestedUnits / 10) * 20);
+      return {
+        projectId: project.id,
+        projectName: project.name,
+        score,
+        resourceCount: projectResources.length
+      };
+    })
+    .filter((summary) => summary.resourceCount > 0)
+    .sort((left, right) => right.score - left.score || left.projectName.localeCompare(right.projectName));
+}
+
+async function extractMcpServers(resources: ScannedResource[]): Promise<Array<{ name: string; resource: ScannedResource }>> {
+  const configs = resources.filter((resource) => path.basename(resource.path).toLowerCase() === "config.toml" && toPosix(resource.path.toLowerCase()).includes("/.codex/"));
+  const servers: Array<{ name: string; resource: ScannedResource }> = [];
+
+  for (const resource of configs) {
+    if (resource.status === "skipped_large" || isSymlink(resource.path)) {
+      continue;
+    }
+
+    try {
+      const preview = await readPreview(resource.path, resource.previewLimitBytes);
+      for (const name of extractMcpServerNames(preview.content)) {
+        servers.push({ name, resource });
+      }
+    } catch {
+      // Keep scan read-only and best-effort; unreadable configs simply add no MCP servers.
+    }
+  }
+
+  return servers;
+}
+
+function extractMcpServerNames(content: string): string[] {
+  const names = new Set<string>();
+  const sectionPattern = /^\s*\[\s*(?:mcp_servers|mcpServers)\.(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*]\s*(?:#.*)?$/;
+
+  for (const line of content.split(/\r?\n/)) {
+    const match = sectionPattern.exec(line);
+    if (match) {
+      names.add(match[1] ?? match[2]);
+    }
+  }
+
+  return [...names].sort((left, right) => left.localeCompare(right));
+}
+
+function isCodexDefaultResource(resourcePath: string, homeDir: string): boolean {
+  const normalizedPath = toPosix(resolveAbsolutePath(resourcePath));
+  const codexRoot = toPosix(path.join(resolveAbsolutePath(homeDir), ".codex"));
+  const defaultPrefixes = [
+    `${codexRoot}/skills/.system/`,
+    `${codexRoot}/plugins/cache/openai-bundled/`,
+    `${codexRoot}/plugins/cache/openai-primary-runtime/`
+  ];
+
+  return defaultPrefixes.some((prefix) => normalizedPath.startsWith(prefix));
+}
+
+function loadLevel(score: number): LoadLevel {
+  if (score >= 75) {
+    return "severe";
+  }
+  if (score >= 50) {
+    return "high";
+  }
+  if (score >= 25) {
+    return "moderate";
+  }
+  return "low";
+}
+
+function clampScore(value: number): number {
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
+function displayResourceLabel(resource: AgentResource): string {
+  return `${resource.name} (${resource.kind})`;
+}
+
+function sumBy<T>(items: T[], getValue: (item: T) => number): number {
+  return items.reduce((sum, item) => sum + getValue(item), 0);
+}
+
+function dedupeScannedResources(resources: ScannedResource[]): ScannedResource[] {
+  return [...new Map(resources.map((resource) => [resource.id, resource])).values()];
+}
+
+function dedupeWorktreeEquivalentResources(resources: ScannedResource[]): ScannedResource[] {
+  const byEffectiveSource = new Map<string, ScannedResource>();
+  for (const resource of resources) {
+    const key = resource.effectiveResourceKey ?? resource.id;
+    const current = byEffectiveSource.get(key);
+    if (!current || resource.path.localeCompare(current.path) < 0) {
+      byEffectiveSource.set(key, resource);
+    }
+  }
+
+  return [...byEffectiveSource.values()];
+}
+
+function buildEffectiveResourceKey(
+  ecosystem: Ecosystem,
+  kind: ResourceKind,
+  repositoryKey: string | undefined,
+  relativePathFromProject: string | undefined,
+  contentIdentity: string | undefined
+): string | undefined {
+  if (!repositoryKey || !relativePathFromProject || !contentIdentity) {
+    return undefined;
+  }
+
+  return sha1(`${ecosystem}:${kind}:${repositoryKey}:${relativePathFromProject}:${contentIdentity}`);
+}
+
+function duplicateIdentityKey(resource: ScannedResource): string {
+  return resource.contentIdentity
+    ? `${worktreeRelativeResourceKey(resource)}:content:${resource.contentIdentity}`
+    : `resource:${resource.id}`;
+}
+
+function worktreeRelativeResourceKey(resource: ScannedResource): string {
+  return resource.relativePathFromProject ?? `${resource.scope}:${resource.signature}`;
+}
+
+async function readContentIdentity(filePath: string, size: number, previewLimitBytes: number): Promise<string | undefined> {
+  if (size > previewLimitBytes || isSymlink(filePath)) {
+    return undefined;
+  }
+
+  try {
+    const content = await fs.readFile(filePath);
+    if (content.includes(0)) {
+      return undefined;
+    }
+    return `${size}:${sha1(content)}`;
+  } catch {
+    return undefined;
+  }
 }
 
 async function readPreview(filePath: string, previewLimitBytes: number): Promise<{ content: string; truncated: boolean }> {
@@ -593,6 +937,9 @@ function classifyKind(filePath: string): ResourceKind {
   }
   if (normalized.includes("/subagents/") || normalized.includes("/agents/")) {
     return "subagent";
+  }
+  if (base === "config.toml") {
+    return "setting";
   }
   if (base.startsWith("settings.")) {
     return "setting";
@@ -685,13 +1032,59 @@ function buildTags(ecosystem: Ecosystem, kind: ResourceKind, scope: ResourceScop
 function stripScannedResource(resource: ScannedResource): AgentResource {
   const {
     signature: _signature,
+    contentIdentity: _contentIdentity,
+    relativePathFromProject: _relativePathFromProject,
     projectRoot: _projectRoot,
     workspaceRoot: _workspaceRoot,
+    repositoryKey: _repositoryKey,
     detectedBy: _detectedBy,
     previewLimitBytes: _previewLimitBytes,
     ...rest
   } = resource;
   return rest;
+}
+
+function detectRepositoryKey(projectRoot?: string): string | undefined {
+  if (!projectRoot) {
+    return undefined;
+  }
+
+  const gitPath = path.join(projectRoot, ".git");
+  if (!existsSync(gitPath)) {
+    return undefined;
+  }
+
+  try {
+    if (lstatSync(gitPath).isDirectory()) {
+      return resolveAbsolutePath(gitPath);
+    }
+
+    const gitDirLine = readFileSync(gitPath, "utf8").match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+    if (!gitDirLine) {
+      return undefined;
+    }
+
+    const gitDir = path.isAbsolute(gitDirLine)
+      ? path.normalize(gitDirLine)
+      : path.resolve(projectRoot, gitDirLine);
+    return path.basename(path.dirname(gitDir)) === "worktrees"
+      ? path.dirname(path.dirname(gitDir))
+      : gitDir;
+  } catch {
+    return undefined;
+  }
+}
+
+function relationshipDomainKey(resource: ScannedResource): string {
+  if (resource.scope === "global") {
+    return "global";
+  }
+
+  if (resource.repositoryKey) {
+    return `repo:${resource.repositoryKey}`;
+  }
+
+  return resource.projectId ? `project:${resource.projectId}` : `scope:${resource.scopePath}`;
 }
 
 function detectScopeConfidence(
@@ -738,7 +1131,7 @@ function toPosix(target: string): string {
   return target.split(path.sep).join("/");
 }
 
-function sha1(value: string): string {
+function sha1(value: string | Buffer): string {
   return createHash("sha1").update(value).digest("hex");
 }
 
@@ -776,4 +1169,14 @@ function groupBy<T, K extends string | number>(items: T[], keyFn: (item: T) => K
   }
 
   return groups;
+}
+
+function countBy<T, K extends string>(items: T[], keyFn: (item: T) => K): Record<K, number> {
+  const counts = {} as Record<K, number>;
+  for (const item of items) {
+    const key = keyFn(item);
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+
+  return counts;
 }

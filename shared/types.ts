@@ -43,6 +43,7 @@ export interface AgentResource {
   scopeConfidence: ScopeConfidence;
   path: string;
   projectId?: string;
+  effectiveResourceKey?: string;
   mtime: string;
   size: number;
   summary: string;
@@ -58,6 +59,51 @@ export interface Relationship {
   reason: string;
 }
 
+export type LoadLevel = "low" | "moderate" | "high" | "severe";
+export type LoadCategoryKey = "prompt_footprint" | "tool_surface" | "conflict_risk" | "scope_complexity";
+
+export interface LoadCategory {
+  key: LoadCategoryKey;
+  label: string;
+  score: number;
+  value: number;
+  detail: string;
+}
+
+export interface LoadContributor {
+  label: string;
+  kind: ResourceKind | "mcp_server";
+  score: number;
+  reason: string;
+  resourceId?: string;
+  projectId?: string;
+  projectName?: string;
+}
+
+export interface ProjectLoadSummary {
+  projectId: string;
+  projectName: string;
+  score: number;
+  resourceCount: number;
+}
+
+export interface ConfigurationLoadAnalysis {
+  baseline: "codex_default_install";
+  score: number;
+  level: LoadLevel;
+  excludedDefaultResources: number;
+  categories: LoadCategory[];
+  topContributors: LoadContributor[];
+  projectSummaries: ProjectLoadSummary[];
+  mcpServers: LoadContributor[];
+  measured?: {
+    runs: number;
+    medianLatencyMs?: number;
+    medianInputTokens?: number;
+    medianToolCalls?: number;
+  };
+}
+
 export interface ScanWarning {
   path: string;
   message: string;
@@ -68,6 +114,7 @@ export interface ScanResult {
   projects: Project[];
   resources: AgentResource[];
   relationships: Relationship[];
+  configurationLoad: ConfigurationLoadAnalysis;
   warnings: ScanWarning[];
   scannedAt: string;
 }
