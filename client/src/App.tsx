@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchDefaults, fetchResourcePreview, scanWorkspaces } from "./api";
 import type {
   AgentResource,
+  ConfigurationLoadAnalysis,
   DefaultsResponse,
   Project,
   Relationship,
@@ -39,6 +40,25 @@ type ProjectContext = {
   projectAgents: AgentResource[];
   globalAgents: AgentResource[];
   instructions: AgentResource[];
+};
+
+type ActiveContextImpact = {
+  projectName: string;
+  score: number;
+  level: "low" | "moderate" | "high";
+  confidence: "exact" | "inferred";
+  evidenceLevel: "file-backed" | "mixed-estimate";
+  instructionTokens: number;
+  ruleFiles: AgentResource[];
+  globalRuleInventory: AgentResource[];
+  conditionalRuleFiles: AgentResource[];
+  localSkillCandidates: AgentResource[];
+  globalSkillCandidates: AgentResource[];
+  localToolCandidates: AgentResource[];
+  globalToolCandidates: AgentResource[];
+  mcpServers: ConfigurationLoadAnalysis["mcpServers"];
+  alwaysLoaded: AgentResource[];
+  caveats: string[];
 };
 
 const initialFilters: Filters = {
@@ -286,6 +306,10 @@ export function App() {
     };
   }, [activeProject, activeProjectId, scanResult]);
 
+  const activeContextImpact = useMemo(() => {
+    return buildActiveContextImpact(scanResult, activeProjectId, activeProject);
+  }, [activeProject, activeProjectId, scanResult]);
+
   useEffect(() => {
     setPreview(null);
     setPreviewError(null);
@@ -445,6 +469,13 @@ export function App() {
               <Metric label="Links" value={overview.totals.relationships} />
             </div>
           </div>
+
+          {scanResult?.configurationLoad ? (
+            <>
+              <ActiveContextImpactPanel impact={activeContextImpact} />
+              <ConfigurationLoadPanel configurationLoad={scanResult.configurationLoad} />
+            </>
+          ) : null}
 
           <DistributionCard
             title="Ecosystem"
@@ -624,6 +655,175 @@ export function App() {
         </aside>
         </section>
       </main>
+    </div>
+  );
+}
+
+function ActiveContextImpactPanel({ impact }: { impact: ActiveContextImpact | null }) {
+  if (!impact) {
+    return (
+      <div className="summary-card active-context-card">
+        <div className="card-header">
+          <div>
+            <span className="card-kicker">Active Context Impact</span>
+            <h2>Select a project</h2>
+          </div>
+        </div>
+        <p className="load-footnote">Run a scan and select a project to estimate likely active Codex context.</p>
+      </div>
+    );
+  }
+
+  const localCandidates = impact.localSkillCandidates.length + impact.localToolCandidates.length;
+  const globalCandidates = impact.globalSkillCandidates.length + impact.globalToolCandidates.length;
+
+  return (
+    <div className={`summary-card active-context-card impact-${impact.level}`}>
+      <div className="card-header">
+        <div>
+          <span className="card-kicker">Active Context Impact</span>
+          <h2>{impact.projectName}</h2>
+        </div>
+        <span className="load-level">{impact.level}</span>
+      </div>
+      <div className="load-score-row">
+        <strong>{impact.score.toLocaleString()}</strong>
+        <p>
+          Likely Codex context for the selected project, compared with a default install. This uses readable files and
+          configured MCP declarations; final runtime-loaded prompts and tool schemas still need live trace evidence.
+        </p>
+      </div>
+      <div className="impact-metrics">
+        <Metric label="Active rules" value={impact.alwaysLoaded.length} />
+        <Metric label="Est. rule tokens" value={impact.instructionTokens} />
+        <Metric label="MCP servers" value={impact.mcpServers.length} />
+        <Metric label="Local candidates" value={localCandidates} />
+      </div>
+      <div className="load-subgrid">
+        <div>
+          <div className="section-row-title">
+            <h3>Likely Always Loaded</h3>
+            <span>{impact.alwaysLoaded.length}</span>
+          </div>
+          <div className="load-mini-list">
+            {impact.alwaysLoaded.slice(0, 4).map((resource) => (
+              <div key={resource.id}>
+                <span title={resource.path}>
+                  {displayName(resource)}
+                  <small>{resource.scope}</small>
+                </span>
+                <strong>{Math.ceil(resource.size / 4).toLocaleString()}</strong>
+              </div>
+            ))}
+            {impact.alwaysLoaded.length === 0 ? <p className="muted-text">No likely always-loaded rules detected.</p> : null}
+          </div>
+        </div>
+        <div>
+          <div className="section-row-title">
+            <h3>Runtime Surface</h3>
+            <span>{impact.evidenceLevel}</span>
+          </div>
+          <div className="impact-facts">
+            <span><b>Configured:</b> {impact.mcpServers.length.toLocaleString()} MCP servers from readable Codex config.</span>
+            <span><b>Likely local:</b> {localCandidates.toLocaleString()} project skills, commands, subagents, or plugins.</span>
+            <span><b>Visible inventory:</b> {globalCandidates.toLocaleString()} global candidates, capped in score because activation is not proven.</span>
+            <span><b>Not counted active:</b> {impact.globalRuleInventory.length.toLocaleString()} global config/rule files.</span>
+            <span><b>Conditional:</b> {impact.conditionalRuleFiles.length.toLocaleString()} nested rule files depend on working directory.</span>
+          </div>
+        </div>
+      </div>
+      <p className="load-footnote">{impact.caveats.join(" ")}</p>
+    </div>
+  );
+}
+
+function ConfigurationLoadPanel({ configurationLoad }: { configurationLoad: ConfigurationLoadAnalysis }) {
+  const topProjects = configurationLoad.projectSummaries
+    .slice()
+    .sort((left, right) => right.score - left.score || left.projectName.localeCompare(right.projectName))
+    .slice(0, 4);
+
+  return (
+    <div className={`summary-card configuration-load-card load-${configurationLoad.level}`}>
+      <div className="card-header">
+        <div>
+          <span className="card-kicker">Workspace Inventory</span>
+          <h2>Scanned resource load</h2>
+        </div>
+        <span className="load-level">inventory {configurationLoad.level}</span>
+      </div>
+      <div className="load-score-row">
+        <strong>{configurationLoad.score.toLocaleString()}</strong>
+        <p>
+          Broad inventory breadth across all scanned roots against the {formatBaseline(configurationLoad.baseline)}
+          {" "}baseline. Use Active Context Impact for the selected-project view.
+        </p>
+      </div>
+      <div className="load-category-list">
+        {configurationLoad.categories.map((category) => (
+          <div className="load-category-row" key={category.key}>
+            <div>
+              <span>{category.label}</span>
+              <small title={category.detail}>
+                {category.value.toLocaleString()} observed · {category.detail}
+              </small>
+            </div>
+            <i>
+              <b style={{ width: `${category.score}%` }} />
+            </i>
+            <strong>{category.score.toLocaleString()}</strong>
+          </div>
+        ))}
+      </div>
+      <div className="load-subgrid">
+        <div>
+          <div className="section-row-title">
+            <h3>Top Contributors</h3>
+            <span>{configurationLoad.topContributors.length}</span>
+          </div>
+          <div className="load-mini-list">
+            {configurationLoad.topContributors.slice(0, 4).map((contributor) => (
+              <div key={`${contributor.kind}-${contributor.label}-${contributor.projectName ?? "global"}`}>
+                <span title={contributor.reason}>
+                  {contributor.label}
+                  {contributor.projectName ? <small>{contributor.projectName}</small> : null}
+                </span>
+                <strong>{contributor.score.toLocaleString()}</strong>
+              </div>
+            ))}
+            {configurationLoad.topContributors.length === 0 ? (
+              <p className="muted-text">No load contributors detected.</p>
+            ) : null}
+          </div>
+        </div>
+        <div>
+          <div className="section-row-title">
+            <h3>Project Load</h3>
+            <span>{configurationLoad.projectSummaries.length}</span>
+          </div>
+          <div className="load-mini-list">
+            {topProjects.map((project) => (
+              <div key={project.projectId}>
+                <span title={`${project.resourceCount.toLocaleString()} resources`}>
+                  {project.projectName}
+                  <small>{project.resourceCount.toLocaleString()} resources</small>
+                </span>
+                <strong>{project.score.toLocaleString()}</strong>
+              </div>
+            ))}
+            {topProjects.length === 0 ? <p className="muted-text">No project-specific load detected.</p> : null}
+          </div>
+        </div>
+      </div>
+      <p className="load-footnote">
+        Excludes {configurationLoad.excludedDefaultResources.toLocaleString()} default resource
+        {configurationLoad.excludedDefaultResources === 1 ? "" : "s"}.
+        {configurationLoad.measured
+          ? ` Measured sample available from ${configurationLoad.measured.runs.toLocaleString()} run${
+              configurationLoad.measured.runs === 1 ? "" : "s"
+            }, but this score remains a static estimate.`
+          : " No measured sample is attached."}
+      </p>
     </div>
   );
 }
@@ -1296,6 +1496,148 @@ function relationshipLabel(type: string): string {
   }
 }
 
+function formatBaseline(baseline: string): string {
+  return baseline.replaceAll("_", " ");
+}
+
+function buildActiveContextImpact(
+  scanResult: ScanResult | null,
+  activeProjectId: string | null,
+  activeProject: Project | null
+): ActiveContextImpact | null {
+  if (!scanResult || !activeProjectId || !activeProject) {
+    return null;
+  }
+
+  const appliesToActiveProject = (resource: AgentResource) =>
+    resource.scope === "global" || resource.projectId === activeProjectId;
+  const allAgentsResources = scanResult.resources.filter(
+    (resource) =>
+      resource.ecosystem === "codex" &&
+      resource.kind === "agents_md" &&
+      !isDefaultCodexResourcePath(resource.path)
+  );
+  const activeAgentsFiles = dedupeEffectiveResources(allAgentsResources
+    .filter((resource) => isAncestorOrSame(dirname(resource.path), activeProject.rootPath)))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const conditionalAgentsFiles = dedupeEffectiveResources(allAgentsResources
+    .filter(
+      (resource) => isAncestorOrSame(activeProject.rootPath, dirname(resource.path)) && dirname(resource.path) !== activeProject.rootPath
+    ))
+    .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
+  const codexResources = scanResult.resources.filter(
+    (resource) => resource.ecosystem === "codex" && appliesToActiveProject(resource) && !isDefaultCodexResourcePath(resource.path)
+  );
+  const activeResources = dedupeResources([...codexResources, ...activeAgentsFiles]);
+  const ruleFiles = codexResources.filter((resource) =>
+    ["agents_md", "setting", "omx", "automation"].includes(resource.kind)
+  );
+  const isCodexConfig = (resource: AgentResource) => basename(resource.path).toLowerCase() === "config.toml";
+  const configuredProjectSettings = activeResources
+    .filter((resource) => resource.scope === "project" && isCodexConfig(resource));
+  const alwaysLoaded = dedupeResources(activeAgentsFiles)
+    .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
+  const globalRuleInventory = ruleFiles
+    .filter(
+      (resource) => resource.scope === "global" && resource.kind !== "agents_md" && !isCodexConfig(resource)
+    )
+    .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
+  const conditionalRuleFiles = ruleFiles
+    .filter(
+      (resource) =>
+        resource.scope === "nested" ||
+        (resource.kind === "agents_md" && isAncestorOrSame(activeProject.rootPath, dirname(resource.path)) && dirname(resource.path) !== activeProject.rootPath)
+    )
+    .concat(conditionalAgentsFiles)
+    .filter((resource, index, resources) => resources.findIndex((candidate) => candidate.id === resource.id) === index)
+    .sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
+  const skillCandidates = codexResources.filter((resource) => resource.kind === "skill");
+  const toolCandidates = codexResources.filter((resource) =>
+    ["command", "subagent", "plugin", "mcp"].includes(resource.kind)
+  );
+  const mcpServers = scanResult.configurationLoad.mcpServers.filter(
+    (server) => !server.projectId || server.projectId === activeProjectId
+  );
+  const localSkillCandidates = skillCandidates.filter((resource) => resource.projectId === activeProjectId);
+  const globalSkillCandidates = skillCandidates.filter((resource) => resource.scope === "global");
+  const localToolCandidates = toolCandidates.filter((resource) => resource.projectId === activeProjectId);
+  const globalToolCandidates = toolCandidates.filter((resource) => resource.scope === "global");
+  const instructionTokens = Math.ceil(alwaysLoaded.reduce((sum, resource) => sum + resource.size, 0) / 4);
+  const promptScore = Math.min(100, (instructionTokens / 30000) * 100);
+  const globalCandidateUnits = Math.min((globalSkillCandidates.length + globalToolCandidates.length) * 0.05, 10);
+  const runtimeSurfaceScore = Math.min(
+    100,
+    ((localSkillCandidates.length + localToolCandidates.length + mcpServers.length * 5 + globalCandidateUnits) / 80) * 100
+  );
+  const scopeScore = Math.min(100, (conditionalRuleFiles.length / 10) * 100);
+  const score = Math.round(promptScore * 0.55 + runtimeSurfaceScore * 0.35 + scopeScore * 0.1);
+  const confidence = codexResources.some((resource) => resource.scopeConfidence === "inferred") ? "inferred" : "exact";
+  const evidenceLevel =
+    confidence === "exact" && mcpServers.length + alwaysLoaded.length + localSkillCandidates.length + localToolCandidates.length > 0
+      ? "file-backed"
+      : "mixed-estimate";
+  const caveats = [
+    "Nested rule files are conditional and not counted as likely always loaded.",
+    "Global skills and plugins are visible inventory, not treated as active session surface.",
+    "Project config files are treated as configured runtime settings, not prompt-loaded rule text.",
+    "Exact loaded tool registry and final prompt still require Codex trace, session metadata, or measured runs."
+  ];
+
+  if (configuredProjectSettings.length > 0) {
+    caveats.unshift(`${configuredProjectSettings.length.toLocaleString()} project config file${configuredProjectSettings.length === 1 ? "" : "s"} counted as runtime configuration only.`);
+  }
+
+  if (confidence === "inferred") {
+    caveats.unshift("Some scopes are inferred from file layout.");
+  }
+
+  return {
+    projectName: activeProject.name,
+    score,
+    level: activeImpactLevel(score),
+    confidence,
+    evidenceLevel,
+    instructionTokens,
+    ruleFiles,
+    globalRuleInventory,
+    conditionalRuleFiles,
+    localSkillCandidates,
+    globalSkillCandidates,
+    localToolCandidates,
+    globalToolCandidates,
+    mcpServers,
+    alwaysLoaded,
+    caveats
+  };
+}
+
+function activeImpactLevel(score: number): ActiveContextImpact["level"] {
+  if (score >= 67) {
+    return "high";
+  }
+  if (score >= 34) {
+    return "moderate";
+  }
+  return "low";
+}
+
+function isDefaultCodexResourcePath(resourcePath: string): boolean {
+  const normalized = resourcePath.split("/").join("/");
+  return (
+    normalized.includes("/.codex/skills/.system/") ||
+    normalized.includes("/.codex/plugins/cache/openai-bundled/") ||
+    normalized.includes("/.codex/plugins/cache/openai-primary-runtime/")
+  );
+}
+
+function dedupeResources(resources: AgentResource[]): AgentResource[] {
+  return [...new Map(resources.map((resource) => [resource.id, resource])).values()];
+}
+
+function dedupeEffectiveResources(resources: AgentResource[]): AgentResource[] {
+  return [...new Map(resources.map((resource) => [resource.effectiveResourceKey ?? resource.id, resource])).values()];
+}
+
 function displayName(resource: AgentResource): string {
   if (resource.name?.trim()) {
     return resource.name;
@@ -1321,6 +1663,26 @@ function displayName(resource: AgentResource): string {
 
 function basename(filePath: string): string {
   return filePath.split("/").filter(Boolean).at(-1) ?? filePath;
+}
+
+function dirname(filePath: string): string {
+  const parts = filePath.split("/").filter(Boolean);
+  if (parts.length <= 1) {
+    return filePath.startsWith("/") ? "/" : "";
+  }
+
+  return `${filePath.startsWith("/") ? "/" : ""}${parts.slice(0, -1).join("/")}`;
+}
+
+function isAncestorOrSame(candidateAncestor: string, targetPath: string): boolean {
+  const ancestor = normalizePath(candidateAncestor);
+  const target = normalizePath(targetPath);
+  return target === ancestor || target.startsWith(`${ancestor}/`);
+}
+
+function normalizePath(filePath: string): string {
+  const normalized = filePath.replaceAll("\\", "/").replace(/\/+/g, "/");
+  return normalized.length > 1 ? normalized.replace(/\/$/, "") : normalized;
 }
 
 function errorMessage(cause: unknown): string {
